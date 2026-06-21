@@ -89,7 +89,7 @@ GPIO1-4 连续排列，可并排焊接：
 ## 烧录与运行
 
 1. 用 USB-C 连接 ESP32-C3 Super Mini
-2. 在 Arduino IDE 中打开 `Voltage.ino`
+2. 在 Arduino IDE 中打开 `swd_ina226.ino`
 3. 按上述设置选择开发板和端口后点击上传
 4. 打开串口监视器（波特率 `115200`）查看初始化日志和实时数据
 
@@ -102,7 +102,7 @@ GPIO1-4 连续排列，可并排焊接：
 ```
 2026-06-21 12:30:45
 Bus:   12.345 V
-Load:  12.346 V
+Sup:   12.346 V
 Shnt:   1.234 mV
 Curr:  456.78 mA
 Powr: 5678.1 mW

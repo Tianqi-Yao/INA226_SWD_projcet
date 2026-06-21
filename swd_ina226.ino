@@ -100,11 +100,13 @@ void setup() {
 void loop() {
   for (int i = 0; i < 5; i++) {
     continuousSampling();
-    delay(3000);
+    if (i < 4) delay(3000);
   }
 
-  Serial.println("INA226 power down for 7s");
-  if (inaAvailable) ina226.powerDown();
+  if (inaAvailable) {
+    Serial.println("INA226 power down for 7s");
+    ina226.powerDown();
+  }
 
   if (displayAvailable) {
     display.clearDisplay();
@@ -123,7 +125,7 @@ void loop() {
   Serial.println();
   if (inaAvailable) {
     ina226.powerUp();
-    delay(10);  // allow first conversion to complete before sampling
+    delay(50);  // INA226 needs one full conversion cycle (~2.1ms default, more with averaging)
   }
 }
 
@@ -219,10 +221,11 @@ void continuousSampling() {
   float supplyV  = busV + (shuntMv / 1000.0f);
   bool  overflow = ina226.overflow;
   // Linear estimate across the usable LiPo window; clamped to [0, 100].
-  float batPct   = constrain((busV - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100.0f,
+  // Use supplyV (IN+ side) — busV (IN- side) underreads at high current due to shunt drop.
+  float batPct   = constrain((supplyV - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100.0f,
                              0.0f, 100.0f);
 
-  DateTime now(0);  // default-init to epoch; overwritten below if RTC is available
+  DateTime now((uint32_t)0);  // default-init to epoch; overwritten below if RTC is available
   String ts;
   if (rtcAvailable) {
     now = rtc.now();
