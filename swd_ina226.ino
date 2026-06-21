@@ -1,5 +1,7 @@
 #include <Wire.h>
 #include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <INA226_WE.h>
@@ -23,26 +25,64 @@
 #define SCREEN_W     128
 #define SCREEN_H     64
 
-// LiPo single-cell voltage range for battery % estimation.
-// Adjust BATT_MIN_V / BATT_MAX_V to match your actual cell chemistry.
-#define BATT_MIN_V  3.0f
-#define BATT_MAX_V  4.2f
+#define BOOT_PIN           9        // ESP32-C3 Super Mini onboard BOOT button
+#define DISPLAY_TIMEOUT_MS 15000UL  // OLED auto-off after 15s of inactivity
+#define LONG_PRESS_MS      3000UL   // Hold duration to trigger WiFi AP mode
 
+// ESP32-C3 Super Mini onboard LED is active LOW (LOW = on, HIGH = off).
+// If your board uses active HIGH, swap the two values below.
+#define LED_PIN 8
+#define LED_ON  LOW
+#define LED_OFF HIGH
+
+#define WIFI_SSID "SWD_INA226"
+#define WIFI_PASS "12345678"
+
+// ── Peripherals ───────────────────────────────────────────────────────────────
 Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, -1);
-INA226_WE ina226(INA226_ADDR);
-RTC_DS3231 rtc;
+INA226_WE        ina226(INA226_ADDR);
+RTC_DS3231       rtc;
+WebServer        server(80);
 
-bool sdAvailable      = false;
-bool displayAvailable = false;
-bool rtcAvailable     = false;
-bool inaAvailable     = false;
+// ── Runtime flags ─────────────────────────────────────────────────────────────
+bool          sdAvailable      = false;
+bool          sdWriteOk        = false;
+bool          displayAvailable = false;
+bool          rtcAvailable     = false;
+bool          inaAvailable     = false;
+bool          isWiFiMode       = false;
+bool          wifiExitReq      = false;
+unsigned long displayWakeMs    = 0;
 
+// ── Button state ──────────────────────────────────────────────────────────────
+static bool          btnLastReading  = HIGH;
+static unsigned long btnDebounceTime = 0;
+static unsigned long btnPressStart   = 0;
+static bool          btnLongHandled  = false;
+
+// ── Last sampled values (served to web page) ──────────────────────────────────
+float  lastBusV     = 0;
+float  lastCurrMa   = 0;
+float  lastPowerMw  = 0;
+bool   lastOverflow = false;
+String lastTs       = "--";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Forward declarations
+// ─────────────────────────────────────────────────────────────────────────────
+void continuousSampling();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setup()
+// ─────────────────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  // Wait for USB CDC to connect (ESP32-C3 uses native USB), timeout 3s
   while (!Serial && millis() < 3000);
 
-  // Wire must be initialized before any I2C device
+  pinMode(BOOT_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LED_OFF);
+
   Wire.begin(SDA_PIN, SCL_PIN);
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -57,6 +97,8 @@ void setup() {
     display.println("Initializing...");
     display.display();
     Serial.println("OLED OK");
+    delay(2000);
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
   }
 
   if (!ina226.init()) {
@@ -70,7 +112,6 @@ void setup() {
     Serial.println("DS3231 init failed - timestamps disabled");
   } else {
     rtcAvailable = true;
-    // If RTC lost power (dead coin cell), sync to compile-time
     if (rtc.lostPower()) {
       Serial.println("RTC lost power - syncing to compile time");
       rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
@@ -83,52 +124,281 @@ void setup() {
     Serial.println("SD card init failed");
   } else {
     sdAvailable = true;
+    sdWriteOk   = true;
     Serial.println("SD card OK");
     if (!SD.exists("/data.csv")) {
       File f = SD.open("/data.csv", FILE_WRITE);
       if (f) {
-        f.println("datetime,bus_V,supply_V,shunt_mV,current_mA,power_mW,battery_pct,overflow");
+        f.println("datetime,bus_V,current_mA,power_mW,overflow");
         f.close();
+      } else {
+        Serial.println("SD header write failed");
+        sdWriteOk = false;
       }
     }
   }
 
-  Serial.println("QuantumVolt ready - sampling started");
+  Serial.println("QuantumVolt ready");
   Serial.println();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Button: debounced short/long press detection
+//   Short press (< LONG_PRESS_MS) → wake OLED
+//   Long press  (≥ LONG_PRESS_MS) → start WiFi AP
+// ─────────────────────────────────────────────────────────────────────────────
+void checkButtonEvents() {
+  bool reading = digitalRead(BOOT_PIN);
+
+  if (reading != btnLastReading) btnDebounceTime = millis();
+  btnLastReading = reading;
+  if (millis() - btnDebounceTime < 30) return;  // debounce
+
+  if (reading == LOW) {
+    if (btnPressStart == 0) {
+      btnPressStart  = millis();
+      if (btnPressStart == 0) btnPressStart = 1;
+      btnLongHandled = false;
+    } else if (!btnLongHandled && millis() - btnPressStart >= LONG_PRESS_MS) {
+      btnLongHandled = true;
+      if (!isWiFiMode) {
+        Serial.println("Long press → starting WiFi AP");
+        startWifi();
+        isWiFiMode = true;
+      }
+    }
+  } else {
+    if (btnPressStart > 0 && !btnLongHandled) {
+      // Short press: wake OLED
+      if (displayAvailable) {
+        displayWakeMs = millis();
+        display.ssd1306_command(SSD1306_DISPLAYON);
+      }
+    }
+    btnPressStart  = 0;
+    btnLongHandled = false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Display helpers
+// ─────────────────────────────────────────────────────────────────────────────
+void checkDisplayTimeout() {
+  if (displayAvailable && displayWakeMs > 0
+      && millis() - displayWakeMs >= DISPLAY_TIMEOUT_MS) {
+    displayWakeMs = 0;
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LED helpers
+// ─────────────────────────────────────────────────────────────────────────────
+void updateLED() {
+  bool anomaly = !sdAvailable || !sdWriteOk || !inaAvailable;
+  if (anomaly) {
+    digitalWrite(LED_PIN, (millis() / 500) % 2 == 0 ? LED_ON : LED_OFF);
+  } else {
+    digitalWrite(LED_PIN, LED_OFF);
+  }
+}
+
+void blinkLEDWifi() {
+  static unsigned long lastToggle = 0;
+  static bool state = false;
+  if (millis() - lastToggle >= 500) {
+    state = !state;
+    digitalWrite(LED_PIN, state ? LED_ON : LED_OFF);
+    lastToggle = millis();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Web UI HTML
+// ─────────────────────────────────────────────────────────────────────────────
+static String buildUI() {
+  char busVBuf[10], currBuf[10], powrBuf[10];
+  snprintf(busVBuf, sizeof(busVBuf), "%.3f", lastBusV);
+  snprintf(currBuf, sizeof(currBuf), "%.2f",  lastCurrMa);
+  snprintf(powrBuf, sizeof(powrBuf), "%.1f",  lastPowerMw);
+
+  String sdStatus = !sdAvailable ? "NO CARD"
+                  : sdWriteOk    ? "OK"
+                                 : "WRITE FAIL";
+
+  return R"rawliteral(<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>QuantumVolt</title>
+  <style>
+    body{font-family:sans-serif;padding:20px;max-width:480px}
+    h1{font-size:1.4em;margin-bottom:12px}
+    p{margin:6px 0}
+    .btns{margin-top:16px}
+    button{padding:10px 16px;font-size:15px;margin:6px 6px 0 0;cursor:pointer}
+  </style>
+  <script>
+    function syncRTC(){
+      var t=new Date().toLocaleString('sv-SE').replace(' ','T');
+      fetch('/rtc-sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({time:t})})
+        .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
+        .then(function(m){alert(m);})
+        .catch(function(e){alert('Sync failed: '+e.message);});
+    }
+    function exitWifi(){
+      fetch('/exit',{method:'POST'})
+        .then(function(){alert('WiFi mode exiting...');})
+        .catch(function(){alert('Request failed');});
+    }
+  </script>
+</head>
+<body>
+  <h1>QuantumVolt</h1>
+  <p><strong>Time:</strong> )rawliteral" + lastTs + R"rawliteral(</p>
+  <p><strong>Bus Voltage:</strong> )rawliteral" + String(busVBuf) + R"rawliteral( V</p>
+  <p><strong>Current:</strong> )rawliteral" + String(currBuf) + R"rawliteral( mA</p>
+  <p><strong>Power:</strong> )rawliteral" + String(powrBuf) + R"rawliteral( mW</p>
+  <p><strong>SD Card:</strong> )rawliteral" + sdStatus + R"rawliteral(</p>
+  <p><strong>Status:</strong> )rawliteral" + String(lastOverflow ? "OVERFLOW" : "OK") + R"rawliteral(</p>
+  <div class="btns">
+    <button onclick="location.reload()">Refresh</button>
+    <button onclick="location.href='/download'">Download CSV</button>
+    <button onclick="syncRTC()">Sync RTC with Phone</button>
+    <button onclick="exitWifi()">Exit WiFi</button>
+  </div>
+</body>
+</html>)rawliteral";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Web route handlers
+// ─────────────────────────────────────────────────────────────────────────────
+void handleRoot() {
+  server.send(200, "text/html", buildUI());
+}
+
+void handleDownload() {
+  if (!sdAvailable) { server.send(503, "text/plain", "SD card not ready"); return; }
+  File f = SD.open("/data.csv", FILE_READ);
+  if (!f) { server.send(404, "text/plain", "data.csv not found"); return; }
+  server.setContentLength(f.size());
+  server.sendHeader("Content-Disposition", "attachment; filename=\"data.csv\"");
+  server.send(200, "text/csv", "");
+  uint8_t buf[512];
+  while (f.available()) {
+    size_t n = f.read(buf, sizeof(buf));
+    if (n == 0) break;
+    server.sendContent((const char*)buf, n);
+  }
+  f.close();
+}
+
+void handleRTCSync() {
+  if (!server.hasArg("plain")) { server.send(400, "text/plain", "Missing body"); return; }
+  String body = server.arg("plain");
+
+  // Extract value of "time" key from {"time":"2026-06-21T12:30:45"}
+  int keyIdx = body.indexOf("\"time\":");
+  if (keyIdx < 0) { server.send(400, "text/plain", "Missing time field"); return; }
+  int q1 = body.indexOf('"', keyIdx + 7);
+  int q2 = (q1 >= 0) ? body.indexOf('"', q1 + 1) : -1;
+  if (q1 < 0 || q2 <= q1) { server.send(400, "text/plain", "Invalid JSON format"); return; }
+  String iso = body.substring(q1 + 1, q2);
+
+  int y, mo, d, h, mi, s;
+  if (sscanf(iso.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6) {
+    server.send(400, "text/plain", "Time parse failed"); return;
+  }
+  static const int daysInMonth[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+  bool isLeap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+  int  maxDay  = (mo == 2 && isLeap) ? 29 : daysInMonth[mo];
+  if (y < 2020 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > maxDay ||
+      h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+    server.send(400, "text/plain", "Time values out of range"); return;
+  }
+  if (rtcAvailable) {
+    rtc.adjust(DateTime(y, mo, d, h, mi, s));
+    Serial.println("RTC synchronized from browser");
+    server.send(200, "text/plain", "RTC synchronized");
+  } else {
+    server.send(503, "text/plain", "RTC not available");
+  }
+}
+
+void handleExit() {
+  wifiExitReq = true;
+  server.send(204);
+  Serial.println("WiFi exit requested via web");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// WiFi lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+void startWifi() {
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+
+  // Register routes once; server.stop() does not clear handlers
+  static bool routesRegistered = false;
+  if (!routesRegistered) {
+    server.on("/",          HTTP_GET,  handleRoot);
+    server.on("/download",  HTTP_GET,  handleDownload);
+    server.on("/rtc-sync",  HTTP_POST, handleRTCSync);
+    server.on("/exit",      HTTP_POST, handleExit);
+    routesRegistered = true;
+  }
+  server.begin();
+  wifiExitReq = false;
+  Serial.println("WiFi AP started — connect to \"" WIFI_SSID "\" then open http://192.168.4.1");
+}
+
+void stopWifi() {
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  wifiExitReq = false;
+  Serial.println("WiFi stopped");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// loop()
+// ─────────────────────────────────────────────────────────────────────────────
 void loop() {
-  for (int i = 0; i < 5; i++) {
-    continuousSampling();
-    if (i < 4) delay(3000);
+  checkButtonEvents();
+
+  if (isWiFiMode) {
+    server.handleClient();
+    blinkLEDWifi();
+
+    static unsigned long lastWifiSample = 0;
+    if (millis() - lastWifiSample >= 3000) {
+      lastWifiSample = millis();
+      continuousSampling();
+    }
+
+    if (wifiExitReq) {
+      stopWifi();
+      isWiFiMode = false;
+    }
+    delay(10);
+    return;
   }
 
-  if (inaAvailable) {
-    Serial.println("INA226 power down for 7s");
-    ina226.powerDown();
-  }
-
-  if (displayAvailable) {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 24);
-    display.println("  INA226 sleeping...");
-    display.display();
-  }
-
-  for (int i = 0; i < 7; i++) {
-    Serial.print(".");
-    delay(1000);
-  }
-  Serial.println("\nINA226 power up");
-  Serial.println();
-  if (inaAvailable) {
-    ina226.powerUp();
-    delay(50);  // INA226 needs one full conversion cycle (~2.1ms default, more with averaging)
+  // Normal mode
+  continuousSampling();
+  for (int j = 0; j < 30; j++) {
+    checkButtonEvents();
+    checkDisplayTimeout();
+    updateLED();
+    delay(100);
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
 String getTimestamp(const DateTime &dt) {
   char buf[20];
   snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
@@ -138,15 +408,13 @@ String getTimestamp(const DateTime &dt) {
 }
 
 void displayOLED(const DateTime &dt, bool dtValid,
-                 float busV, float supplyV, float shuntMv,
-                 float currMa, float powerMw, float batPct,
+                 float busV, float currMa, float powerMw,
                  bool overflow) {
   char buf[22];
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
 
-  // Row 0 (y=0): date and time (or placeholder when RTC unavailable)
   if (dtValid) {
     snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d",
              dt.year(), dt.month(), dt.day(),
@@ -156,76 +424,59 @@ void displayOLED(const DateTime &dt, bool dtValid,
   }
   display.setCursor(0, 0);  display.print(buf);
 
-  // Row 1 (y=8):  bus voltage (= load-side voltage, measured at IN-)
   snprintf(buf, sizeof(buf), "Bus:  %6.3f V", busV);
   display.setCursor(0, 8);  display.print(buf);
 
-  // Row 2 (y=16): supply voltage (= busV + shunt drop, reconstructed IN+ side)
-  snprintf(buf, sizeof(buf), "Sup:  %6.3f V", supplyV);
+  snprintf(buf, sizeof(buf), "Curr: %6.2f mA", currMa);
   display.setCursor(0, 16); display.print(buf);
 
-  // Row 3 (y=24): shunt voltage
-  snprintf(buf, sizeof(buf), "Shnt: %6.3f mV", shuntMv);
+  snprintf(buf, sizeof(buf), "Powr: %6.1f mW", powerMw);
   display.setCursor(0, 24); display.print(buf);
 
-  // Row 4 (y=32): current
-  snprintf(buf, sizeof(buf), "Curr: %6.2f mA", currMa);
+  if (!sdAvailable) {
+    snprintf(buf, sizeof(buf), "SD: NO CARD");
+  } else if (sdWriteOk) {
+    snprintf(buf, sizeof(buf), "SD: OK");
+  } else {
+    snprintf(buf, sizeof(buf), "SD: WRITE FAIL");
+  }
   display.setCursor(0, 32); display.print(buf);
 
-  // Row 5 (y=40): power
-  snprintf(buf, sizeof(buf), "Powr: %6.1f mW", powerMw);
-  display.setCursor(0, 40); display.print(buf);
-
-  // Row 6 (y=48): battery percentage
-  snprintf(buf, sizeof(buf), "Bat:  %5.1f %%", batPct);
-  display.setCursor(0, 48); display.print(buf);
-
-  // Row 7 (y=56): status
-  display.setCursor(0, 56);
+  display.setCursor(0, 40);
   display.print(overflow ? "Status: OVERFLOW!" : "Status: OK");
 
   display.display();
 }
 
 void logToSD(const String &timestamp,
-             float busV, float supplyV, float shuntMv,
-             float currMa, float powerMw, float batPct,
+             float busV, float currMa, float powerMw,
              bool overflow) {
   if (!sdAvailable) return;
   File f = SD.open("/data.csv", FILE_APPEND);
   if (!f) {
     Serial.println("SD write error");
+    sdWriteOk = false;
     return;
   }
   f.print(timestamp); f.print(",");
-  f.print(busV, 3);     f.print(",");
-  f.print(supplyV, 3);  f.print(",");
-  f.print(shuntMv, 3);  f.print(",");
-  f.print(currMa, 2);   f.print(",");
-  f.print(powerMw, 2);  f.print(",");
-  f.print(batPct, 1);   f.print(",");
+  f.print(busV, 3);    f.print(",");
+  f.print(currMa, 2);  f.print(",");
+  f.print(powerMw, 2); f.print(",");
   f.println(overflow ? 1 : 0);
   f.close();
+  sdWriteOk = true;
 }
 
 void continuousSampling() {
   if (!inaAvailable) return;
 
   ina226.readAndClearFlags();
-  float shuntMv  = ina226.getShuntVoltage_mV();
   float busV     = ina226.getBusVoltage_V();
   float currMa   = ina226.getCurrent_mA();
   float powerMw  = ina226.getBusPower();
-  // busV is the load-side voltage (measured at IN-).
-  // Adding the shunt drop reconstructs the supply-side voltage (at IN+).
-  float supplyV  = busV + (shuntMv / 1000.0f);
   bool  overflow = ina226.overflow;
-  // Linear estimate across the usable LiPo window; clamped to [0, 100].
-  // Use supplyV (IN+ side) — busV (IN- side) underreads at high current due to shunt drop.
-  float batPct   = constrain((supplyV - BATT_MIN_V) / (BATT_MAX_V - BATT_MIN_V) * 100.0f,
-                             0.0f, 100.0f);
 
-  DateTime now((uint32_t)0);  // default-init to epoch; overwritten below if RTC is available
+  DateTime now((uint32_t)0);
   String ts;
   if (rtcAvailable) {
     now = rtc.now();
@@ -234,19 +485,25 @@ void continuousSampling() {
     ts = "NO-RTC";
   }
 
+  // Save for web page
+  lastBusV    = busV;
+  lastCurrMa  = currMa;
+  lastPowerMw = powerMw;
+  lastOverflow = overflow;
+  lastTs      = ts;
+
   Serial.println("=== " + ts + " ===");
-  Serial.print("Bus Voltage    [V]:  "); Serial.println(busV, 3);
-  Serial.print("Supply Voltage [V]:  "); Serial.println(supplyV, 3);
-  Serial.print("Shunt Voltage  [mV]: "); Serial.println(shuntMv, 3);
-  Serial.print("Current        [mA]: "); Serial.println(currMa, 2);
-  Serial.print("Power          [mW]: "); Serial.println(powerMw, 2);
-  Serial.print("Battery        [%]:  "); Serial.println(batPct, 1);
+  Serial.print("Bus Voltage [V]:  "); Serial.println(busV, 3);
+  Serial.print("Current     [mA]: "); Serial.println(currMa, 2);
+  Serial.print("Power       [mW]: "); Serial.println(powerMw, 2);
   Serial.println(overflow ? "Status: OVERFLOW!" : "Status: OK");
   Serial.println();
 
-  if (displayAvailable) {
-    displayOLED(now, rtcAvailable, busV, supplyV, shuntMv,
-                currMa, powerMw, batPct, overflow);
+  checkButtonEvents();
+  checkDisplayTimeout();
+  if (displayAvailable && displayWakeMs > 0) {
+    displayOLED(now, rtcAvailable, busV, currMa, powerMw, overflow);
   }
-  logToSD(ts, busV, supplyV, shuntMv, currMa, powerMw, batPct, overflow);
+  logToSD(ts, busV, currMa, powerMw, overflow);
+  if (!isWiFiMode) updateLED();
 }

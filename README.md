@@ -1,139 +1,200 @@
-# 电池电压电流监测仪
+# SWD INA226 Power Monitor
 
-基于 **ESP32-C3 Super Mini** 的便携式电池监测系统，通过 INA226 传感器实时采集电压、电流、功率等数据，显示在 0.96 寸 OLED 屏幕上，并由 DS3231 RTC 打上时间戳后写入 MicroSD 卡留存。
-
----
-
-## 功能特性
-
-- 实时测量总线电压、负载电压、分流电压、电流、功率
-- 估算电池电量百分比
-- 0.96 寸 OLED（128×64）满屏 8 行信息展示
-- DS3231 RTC 提供精准时间戳，断电后时间不丢失
-- 每次采样自动追加写入 SD 卡 CSV 文件，便于后续分析
-- INA226 采样 5 次后自动进入省电模式 7 秒，循环运行
-- 串口同步输出所有测量值，方便调试
+A portable power monitoring system based on the **ESP32-C3 Super Mini**, using an INA226 sensor to measure bus voltage, current, and power in real time. Readings are timestamped by a DS3231 RTC and logged to a MicroSD card. Supports OLED display with button wake and a WiFi hotspot for remote access.
 
 ---
 
-## 硬件清单
+## Features
 
-| 器件 | 型号 / 规格 |
-|------|------------|
-| 微控制器 | ESP32-C3 Super Mini |
-| 电流/电压传感器 | INA226（最高支持 36V） |
-| 显示屏 | 0.96 寸 OLED，128×64，I2C（SSD1306） |
-| 实时时钟 | DS3231 RTC 模块 |
-| 存储模块 | MicroSD Card Module（SPI 接口） |
+- Real-time measurement of bus voltage, current, and power — sampled every 3 seconds
+- DS3231 RTC timestamps every reading; time is retained across power cycles
+- Readings appended to a CSV file on the SD card
+- Short-press BOOT button to wake the OLED; auto-off after 15 seconds of inactivity
+- **Long-press BOOT button (3 s)** to start a WiFi access point — connect your phone and open `192.168.4.1` to:
+  - View live measurements
+  - Download `data.csv`
+  - Sync the RTC from your phone's clock
+- Onboard LED status indicator: blinks on SD or INA226 fault, off when all is well
+- Serial output of all values for debugging
+- Graceful degradation: each peripheral initializes independently; a missing module does not affect the rest
 
 ---
 
-## 接线说明
+## Hardware
 
-### I2C 总线（OLED + INA226 + DS3231 共享）
+| Component | Part |
+|-----------|------|
+| Microcontroller | ESP32-C3 Super Mini |
+| Current/voltage sensor | INA226 (up to 36 V, onboard shunt R100 = 100 mΩ) |
+| Display | 0.96" OLED 128×64 I2C (SSD1306) — optional; removing it requires no code change |
+| Real-time clock | DS3231 RTC module |
+| Storage | MicroSD card module (SPI) |
 
-| 设备引脚 | ESP32-C3 Super Mini |
-|---------|---------------------|
+---
+
+## Wiring
+
+### I2C bus — OLED, INA226, DS3231 (shared)
+
+| Device pin | ESP32-C3 Super Mini |
+|-----------|---------------------|
 | SDA | GPIO 5 |
 | SCL | GPIO 6 |
-| VCC | 3.3V |
+| VCC | 3.3 V |
 | GND | GND |
 
-三个 I2C 设备通过不同地址区分：OLED `0x3C`、INA226 `0x40`、DS3231 `0x68`。
+The three I2C devices are distinguished by address: OLED `0x3C`, INA226 `0x40`, DS3231 `0x68`.
 
-### SPI 总线（MicroSD）
+### SPI bus — MicroSD
 
-GPIO1-4 连续排列，可并排焊接：
+GPIOs 1–4 are consecutive for easy soldering:
 
-| 设备引脚 | ESP32-C3 Super Mini |
-|---------|---------------------|
+| Device pin | ESP32-C3 Super Mini |
+|-----------|---------------------|
 | MISO | GPIO 1 |
 | CLK  | GPIO 2 |
 | MOSI | GPIO 3 |
 | CS   | GPIO 4 |
-| VCC | 3.3V |
+| VCC | 3.3 V |
 | GND | GND |
 
-### INA226 被测回路接线
+> ⚠️ GPIO2 is a strapping pin on the ESP32-C3. If it is pulled low at boot, the chip enters USB-JTAG download mode. Add a 10 kΩ pull-up resistor from GPIO2 to 3.3 V on your PCB.
 
-| INA226 引脚 | 连接 |
-|------------|------|
-| IN+ | 被测电源正极 |
-| IN- | 被测电源负极 / 负载正极 |
+### INA226 — high-side current sensing
+
+```
+Supply+ → IN+ ──[R100 shunt]──→ IN− → Load → Supply−
+                                  ↑
+                                VBUS ← connect here
+                                GND  ← connect to ESP32 GND = Supply−
+```
+
+| INA226 pin | Connection |
+|-----------|------------|
+| IN+ | Supply positive (before shunt) |
+| IN− | Load positive (after shunt) |
+| VBUS | Same node as IN− |
+| GND | Common ground with ESP32 and supply negative |
+
+> Bus voltage reads 0 if VBUS is left unconnected or GND is not shared.
+
+### Onboard pins
+
+| Function | GPIO |
+|----------|------|
+| BOOT button | GPIO 9 (internal pull-up, LOW when pressed) |
+| Status LED | GPIO 8 (active LOW) |
 
 ---
 
-## 软件环境
+## Software Setup
 
-### Arduino IDE 设置
+### Arduino IDE
 
-1. 在 Boards Manager 搜索 `esp32`，安装 **esp32 by Espressif Systems**
-2. 开发板选择：**ESP32C3 Dev Module**
-3. **USB CDC On Boot** 设为 **Enabled**（让 Serial 映射到 USB 口）
+1. In Boards Manager, search for `esp32` and install **esp32 by Espressif Systems**
+2. Select board: **ESP32C3 Dev Module**
+3. Set **USB CDC On Boot** to **Enabled** (maps `Serial` to the USB port)
 
-### 需要安装的库
+### Libraries to install
 
-在 Sketch → Include Library → Manage Libraries 中搜索安装：
+Search and install via Sketch → Include Library → Manage Libraries:
 
-| 库名 | 作者 |
-|------|------|
+| Library | Author |
+|---------|--------|
 | Adafruit SSD1306 | Adafruit |
 | Adafruit GFX Library | Adafruit |
 | RTClib | Adafruit |
 | INA226_WE | Wolfgang Ewald |
 
-`Wire`、`SPI`、`SD` 为 Arduino ESP32 核心内置库，无需单独安装。
+`Wire`, `SPI`, `SD`, `WiFi`, and `WebServer` are bundled with the ESP32 Arduino core — no separate installation needed.
 
 ---
 
-## 烧录与运行
+## Flashing
 
-1. 用 USB-C 连接 ESP32-C3 Super Mini
-2. 在 Arduino IDE 中打开 `swd_ina226.ino`
-3. 按上述设置选择开发板和端口后点击上传
-4. 打开串口监视器（波特率 `115200`）查看初始化日志和实时数据
+1. Connect the ESP32-C3 Super Mini via USB-C
+2. Open `swd_ina226.ino` in Arduino IDE
+3. Select the correct board and port, then click Upload
+4. Open Serial Monitor at **115200 baud** to view the init log and live readings
 
 ---
 
-## OLED 显示布局
+## OLED Display
 
-上电后 OLED 实时滚动显示 8 行信息：
+The OLED shows a 2-second splash screen on boot, then turns off. **Short-press the BOOT button** to wake it; it turns off again after 15 seconds of inactivity.
 
 ```
 2026-06-21 12:30:45
-Bus:   12.345 V
-Sup:   12.346 V
-Shnt:   1.234 mV
-Curr:  456.78 mA
-Powr: 5678.1 mW
-Bat:    87.3 %
+Bus:   5.091 V
+Curr: 391.42 mA
+Powr: 1990.3 mW
+SD: OK
 Status: OK
 ```
 
+| Row | Content |
+|-----|---------|
+| 1 | RTC timestamp (shows `No RTC` if unavailable) |
+| 2 | Bus voltage (IN− to GND) |
+| 3 | Current |
+| 4 | Power |
+| 5 | SD card status: `OK` / `WRITE FAIL` / `NO CARD` |
+| 6 | Measurement status: `OK` / `OVERFLOW!` |
+
 ---
 
-## SD 卡数据格式
+## WiFi Hotspot
 
-SD 卡根目录下自动生成 `data.csv`，每次采样追加一行，重启后继续写入不覆盖：
+**Long-press the BOOT button for 3 seconds** to start the access point:
+
+| | |
+|-|-|
+| SSID | `SWD_INA226` |
+| Password | `12345678` |
+| URL | `http://192.168.4.1` |
+
+The web page provides:
+
+- Live data (refreshed on each page load)
+- **Download CSV** — downloads `data.csv` directly to your device
+- **Sync RTC with Phone** — sets the DS3231 to your phone's current time
+- **Exit WiFi** — shuts down the hotspot and returns to normal mode
+
+Sampling continues every 3 seconds while the hotspot is active. The LED blinks continuously to indicate WiFi is on.
+
+---
+
+## CSV Format
+
+`data.csv` is created automatically in the SD card root directory. Each sample appends one row; existing data is never overwritten on reboot.
 
 ```csv
-datetime,bus_V,supply_V,shunt_mV,current_mA,power_mW,battery_pct,overflow
-2026-06-21 12:30:45,12.345,12.346,1.234,456.78,5678.90,87.3,0
+datetime,bus_V,current_mA,power_mW,overflow
+2026-06-21 12:30:45,5.091,391.42,1990.30,0
 ```
 
-- `bus_V`：IN− 引脚侧电压（负载电压，相对 GND）
-- `supply_V`：IN+ 引脚侧电压（supply_V = bus_V + shunt_mV/1000）
-- `overflow` 字段为 `1` 表示电流超出 INA226 量程，需更换更大分流电阻或调整量程配置。
-- 电量百分比基于单节 LiPo（3.0V=0%，4.2V=100%），如使用其他电池类型请修改 `BATT_MIN_V` / `BATT_MAX_V`。
+| Field | Description |
+|-------|-------------|
+| `datetime` | RTC timestamp; `NO-RTC` if the clock is unavailable |
+| `bus_V` | Voltage at IN− relative to GND (load-side voltage) |
+| `current_mA` | Current derived from shunt voltage ÷ 100 mΩ |
+| `power_mW` | Power from INA226 internal register |
+| `overflow` | `1` when current exceeds the measurement range (> 819 mA); values are unreliable |
 
 ---
 
-## 采样节奏
+## LED Status
+
+| LED | Meaning |
+|-----|---------|
+| Off | Normal operation; SD and INA226 both healthy |
+| Blinking 1 Hz | SD not mounted, write failure, or INA226 fault |
+| Blinking 1 Hz (WiFi mode) | WiFi hotspot active |
+
+---
+
+## Sampling Cycle
 
 ```
-连续采样 5 次（每次间隔 3s）
-         ↓
-INA226 进入省电模式 7s
-         ↓
-INA226 唤醒，重新开始
+Read INA226 → Write SD → Wait 3 s → repeat
 ```
