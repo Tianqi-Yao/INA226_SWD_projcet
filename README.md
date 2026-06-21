@@ -34,8 +34,8 @@
 
 | 设备引脚 | ESP32-C3 Super Mini |
 |---------|---------------------|
-| SDA | GPIO 4 |
-| SCL | GPIO 5 |
+| SDA | GPIO 5 |
+| SCL | GPIO 6 |
 | VCC | 3.3V |
 | GND | GND |
 
@@ -43,12 +43,14 @@
 
 ### SPI 总线（MicroSD）
 
+GPIO1-4 连续排列，可并排焊接：
+
 | 设备引脚 | ESP32-C3 Super Mini |
 |---------|---------------------|
-| MOSI | GPIO 6 |
-| MISO | GPIO 7 |
-| SCK | GPIO 10 |
-| CS | GPIO 3 |
+| MISO | GPIO 1 |
+| CLK  | GPIO 2 |
+| MOSI | GPIO 3 |
+| CS   | GPIO 4 |
 | VCC | 3.3V |
 | GND | GND |
 
@@ -115,11 +117,14 @@ Status: OK
 SD 卡根目录下自动生成 `data.csv`，每次采样追加一行，重启后继续写入不覆盖：
 
 ```csv
-datetime,bus_V,load_V,shunt_mV,current_mA,power_mW,battery_pct,overflow
+datetime,bus_V,supply_V,shunt_mV,current_mA,power_mW,battery_pct,overflow
 2026-06-21 12:30:45,12.345,12.346,1.234,456.78,5678.90,87.3,0
 ```
 
-`overflow` 字段为 `1` 表示电流超出 INA226 量程，需更换更大分流电阻或调整量程配置。
+- `bus_V`：IN− 引脚侧电压（负载电压，相对 GND）
+- `supply_V`：IN+ 引脚侧电压（supply_V = bus_V + shunt_mV/1000）
+- `overflow` 字段为 `1` 表示电流超出 INA226 量程，需更换更大分流电阻或调整量程配置。
+- 电量百分比基于单节 LiPo（3.0V=0%，4.2V=100%），如使用其他电池类型请修改 `BATT_MIN_V` / `BATT_MAX_V`。
 
 ---
 
