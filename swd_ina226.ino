@@ -20,7 +20,7 @@
 #define SD_MOSI  3
 #define SD_CS    4
 
-#define INA226_ADDR  0x40
+#define INA226_ADDR  0x44
 #define OLED_ADDR    0x3C
 #define SCREEN_W     128
 #define SCREEN_H     64
@@ -60,6 +60,9 @@ static unsigned long btnDebounceTime = 0;
 static unsigned long btnPressStart   = 0;
 static bool          btnLongHandled  = false;
 
+// ── SD log state ─────────────────────────────────────────────────────────────
+String logLastPath  = "";  // tracks current daily file; reset forces header re-creation
+
 // ── Last sampled values (served to web page) ──────────────────────────────────
 float  lastBusV     = 0;
 float  lastCurrMa   = 0;
@@ -84,6 +87,24 @@ void setup() {
   digitalWrite(LED_PIN, LED_OFF);
 
   Wire.begin(SDA_PIN, SCL_PIN);
+
+  // I2C bus scan — helps diagnose address mismatches
+  Serial.println("I2C scan:");
+  int i2cFound = 0;
+  for (byte addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      Serial.print("  0x"); if (addr < 16) Serial.print("0");
+      Serial.print(addr, HEX);
+      if (addr == 0x3C || addr == 0x3D) Serial.print(" (OLED)");
+      if (addr >= 0x40 && addr <= 0x4F) Serial.print(" (INA226)");
+      if (addr == 0x68 || addr == 0x69) Serial.print(" (DS3231)");
+      Serial.println();
+      i2cFound++;
+    }
+  }
+  if (i2cFound == 0) Serial.println("  No devices found");
+  Serial.println();
 
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("SSD1306 init failed");
@@ -236,7 +257,8 @@ static String buildUI() {
         String name = (sl >= 0) ? raw.substring(sl + 1) : raw;
         if (!entry.isDirectory() && name.startsWith("data_") && name.endsWith(".csv")) {
           String path = "/" + name;
-          fileListHtml += "<li><a href='/download?path=" + htmlEscape(path) + "'>" + htmlEscape(name) + "</a></li>";
+          fileListHtml += "<li><a href='/download?path=" + htmlEscape(path) + "'>" + htmlEscape(name) + "</a>"
+                       + " <button onclick=\"deleteFile('" + htmlEscape(path) + "')\">Delete</button></li>";
         }
         entry.close();
       }
@@ -271,6 +293,20 @@ static String buildUI() {
         .then(function(){alert('WiFi mode exiting...');})
         .catch(function(){alert('Request failed');});
     }
+    function deleteFile(path){
+      if(!confirm('Delete '+path.split('/').pop()+'?')) return;
+      fetch('/delete?path='+encodeURIComponent(path),{method:'POST'})
+        .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
+        .then(function(m){alert(m);location.reload();})
+        .catch(function(e){alert('Delete failed: '+e.message);});
+    }
+    function deleteAll(){
+      if(!confirm('Delete ALL data files? This cannot be undone.')) return;
+      fetch('/delete-all',{method:'POST'})
+        .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.text();})
+        .then(function(m){alert(m);location.reload();})
+        .catch(function(e){alert('Delete failed: '+e.message);});
+    }
   </script>
 </head>
 <body>
@@ -287,6 +323,7 @@ static String buildUI() {
     <button onclick="exitWifi()">Exit WiFi</button>
   </div>
   <h2>Data Files</h2>
+  <button onclick="deleteAll()" style="margin-bottom:8px">Delete All</button>
   <ul>
   )rawliteral" + fileListHtml + R"rawliteral(
   </ul>
@@ -370,6 +407,54 @@ void handleExit() {
   Serial.println("WiFi exit requested via web");
 }
 
+void handleDelete() {
+  if (!sdAvailable) { server.send(503, "text/plain", "SD not ready"); return; }
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path"); return; }
+  String path = server.arg("path");
+  if (!path.startsWith("/data_") || !path.endsWith(".csv") || path.indexOf("..") >= 0) {
+    server.send(403, "text/plain", "Path not allowed"); return;
+  }
+  if (!SD.exists(path)) { server.send(404, "text/plain", "File not found"); return; }
+  if (SD.remove(path)) {
+    if (logLastPath == path) logLastPath = "";  // force header re-creation if needed
+    Serial.println("Deleted: " + path);
+    server.send(200, "text/plain", "Deleted: " + path);
+  } else {
+    server.send(500, "text/plain", "Delete failed");
+  }
+}
+
+void handleDeleteAll() {
+  if (!sdAvailable) { server.send(503, "text/plain", "SD not ready"); return; }
+  // Collect matching files first, then delete (avoid mutating dir while iterating)
+  String toDelete[64];
+  int count = 0;
+  File root = SD.open("/");
+  if (root) {
+    while (count < 64) {
+      File entry = root.openNextFile();
+      if (!entry) break;
+      String raw = String(entry.name());
+      int sl = raw.lastIndexOf('/');
+      String name = (sl >= 0) ? raw.substring(sl + 1) : raw;
+      if (!entry.isDirectory() && name.startsWith("data_") && name.endsWith(".csv"))
+        toDelete[count++] = "/" + name;
+      entry.close();
+    }
+    root.close();
+  }
+  bool truncated = (count == 64);
+  int deleted = 0;
+  for (int i = 0; i < count; i++) {
+    if (SD.remove(toDelete[i])) deleted++;
+  }
+  logLastPath = "";  // force header re-creation on next write
+  String msg = "Deleted " + String(deleted) + " file(s)";
+  if (truncated) msg += " — WARNING: >64 files found, run again to delete remaining";
+  Serial.println(msg);
+  server.send(200, "text/plain", msg);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // WiFi lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
@@ -383,10 +468,12 @@ bool startWifi() {
   // Register routes once; server.stop() does not clear handlers
   static bool routesRegistered = false;
   if (!routesRegistered) {
-    server.on("/",          HTTP_GET,  handleRoot);
-    server.on("/download",  HTTP_GET,  handleDownload);
-    server.on("/rtc-sync",  HTTP_POST, handleRTCSync);
-    server.on("/exit",      HTTP_POST, handleExit);
+    server.on("/",           HTTP_GET,  handleRoot);
+    server.on("/download",   HTTP_GET,  handleDownload);
+    server.on("/rtc-sync",   HTTP_POST, handleRTCSync);
+    server.on("/exit",       HTTP_POST, handleExit);
+    server.on("/delete",     HTTP_POST, handleDelete);
+    server.on("/delete-all", HTTP_POST, handleDeleteAll);
     routesRegistered = true;
   }
   server.begin();
@@ -499,8 +586,7 @@ void logToSD(const String &timestamp,
   String path = "/data_" + dateStr + ".csv";
 
   // Write CSV header only when the file is first created (checked once per day)
-  static String lastPath = "";
-  if (path != lastPath) {
+  if (path != logLastPath) {
     if (!SD.exists(path)) {
       File fh = SD.open(path, FILE_WRITE);
       if (fh) {
@@ -511,7 +597,7 @@ void logToSD(const String &timestamp,
         return;
       }
     }
-    lastPath = path;
+    logLastPath = path;
   }
 
   File f = SD.open(path, FILE_APPEND);
