@@ -93,7 +93,7 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.println("QuantumVolt");
+    display.println("SWD_INA226");
     display.println("Initializing...");
     display.display();
     Serial.println("OLED OK");
@@ -126,19 +126,9 @@ void setup() {
     sdAvailable = true;
     sdWriteOk   = true;
     Serial.println("SD card OK");
-    if (!SD.exists("/data.csv")) {
-      File f = SD.open("/data.csv", FILE_WRITE);
-      if (f) {
-        f.println("datetime,bus_V,current_mA,power_mW,overflow");
-        f.close();
-      } else {
-        Serial.println("SD header write failed");
-        sdWriteOk = false;
-      }
-    }
   }
 
-  Serial.println("QuantumVolt ready");
+  Serial.println("SWD_INA226 ready");
   Serial.println();
 }
 
@@ -163,8 +153,7 @@ void checkButtonEvents() {
       btnLongHandled = true;
       if (!isWiFiMode) {
         Serial.println("Long press → starting WiFi AP");
-        startWifi();
-        isWiFiMode = true;
+        isWiFiMode = startWifi();
       }
     }
   } else {
@@ -216,6 +205,14 @@ void blinkLEDWifi() {
 // ─────────────────────────────────────────────────────────────────────────────
 // Web UI HTML
 // ─────────────────────────────────────────────────────────────────────────────
+static String htmlEscape(const String &s) {
+  String r = s;
+  r.replace("&", "&amp;");
+  r.replace("<", "&lt;");
+  r.replace(">", "&gt;");
+  r.replace("\"", "&quot;");
+  return r;
+}
 static String buildUI() {
   char busVBuf[10], currBuf[10], powrBuf[10];
   snprintf(busVBuf, sizeof(busVBuf), "%.3f", lastBusV);
@@ -226,12 +223,34 @@ static String buildUI() {
                   : sdWriteOk    ? "OK"
                                  : "WRITE FAIL";
 
+  // Build file list from SD root (data_*.csv files only)
+  String fileListHtml;
+  if (sdAvailable) {
+    File root = SD.open("/");
+    if (root) {
+      while (true) {
+        File entry = root.openNextFile();
+        if (!entry) break;
+        String raw = String(entry.name());
+        int sl = raw.lastIndexOf('/');
+        String name = (sl >= 0) ? raw.substring(sl + 1) : raw;
+        if (!entry.isDirectory() && name.startsWith("data_") && name.endsWith(".csv")) {
+          String path = "/" + name;
+          fileListHtml += "<li><a href='/download?path=" + htmlEscape(path) + "'>" + htmlEscape(name) + "</a></li>";
+        }
+        entry.close();
+      }
+      root.close();
+    }
+  }
+  if (fileListHtml.isEmpty()) fileListHtml = "<li>No data files yet</li>";
+
   return R"rawliteral(<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>QuantumVolt</title>
+  <title>SWD_INA226</title>
   <style>
     body{font-family:sans-serif;padding:20px;max-width:480px}
     h1{font-size:1.4em;margin-bottom:12px}
@@ -255,7 +274,7 @@ static String buildUI() {
   </script>
 </head>
 <body>
-  <h1>QuantumVolt</h1>
+  <h1>SWD_INA226</h1>
   <p><strong>Time:</strong> )rawliteral" + lastTs + R"rawliteral(</p>
   <p><strong>Bus Voltage:</strong> )rawliteral" + String(busVBuf) + R"rawliteral( V</p>
   <p><strong>Current:</strong> )rawliteral" + String(currBuf) + R"rawliteral( mA</p>
@@ -264,10 +283,13 @@ static String buildUI() {
   <p><strong>Status:</strong> )rawliteral" + String(lastOverflow ? "OVERFLOW" : "OK") + R"rawliteral(</p>
   <div class="btns">
     <button onclick="location.reload()">Refresh</button>
-    <button onclick="location.href='/download'">Download CSV</button>
     <button onclick="syncRTC()">Sync RTC with Phone</button>
     <button onclick="exitWifi()">Exit WiFi</button>
   </div>
+  <h2>Data Files</h2>
+  <ul>
+  )rawliteral" + fileListHtml + R"rawliteral(
+  </ul>
 </body>
 </html>)rawliteral";
 }
@@ -281,10 +303,21 @@ void handleRoot() {
 
 void handleDownload() {
   if (!sdAvailable) { server.send(503, "text/plain", "SD card not ready"); return; }
-  File f = SD.open("/data.csv", FILE_READ);
-  if (!f) { server.send(404, "text/plain", "data.csv not found"); return; }
+  if (!server.hasArg("path")) { server.send(400, "text/plain", "Missing path parameter"); return; }
+
+  String path = server.arg("path");
+  // Only allow /data_*.csv files; reject directory traversal
+  if (!path.startsWith("/data_") || !path.endsWith(".csv") || path.indexOf("..") >= 0) {
+    server.send(403, "text/plain", "Path not allowed");
+    return;
+  }
+
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) { if (f) f.close(); server.send(404, "text/plain", "File not found"); return; }
+
+  String filename = path.substring(path.lastIndexOf('/') + 1);
   server.setContentLength(f.size());
-  server.sendHeader("Content-Disposition", "attachment; filename=\"data.csv\"");
+  server.sendHeader("Content-Disposition", "attachment; filename=\"" + filename + "\"");
   server.send(200, "text/csv", "");
   uint8_t buf[512];
   while (f.available()) {
@@ -311,11 +344,15 @@ void handleRTCSync() {
   if (sscanf(iso.c_str(), "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &s) != 6) {
     server.send(400, "text/plain", "Time parse failed"); return;
   }
+  // Validate year, month, and time fields before using mo as an array index
+  if (y < 2020 || y > 2099 || mo < 1 || mo > 12 ||
+      h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+    server.send(400, "text/plain", "Time values out of range"); return;
+  }
   static const int daysInMonth[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
   bool isLeap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
   int  maxDay  = (mo == 2 && isLeap) ? 29 : daysInMonth[mo];
-  if (y < 2020 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > maxDay ||
-      h < 0 || h > 23 || mi < 0 || mi > 59 || s < 0 || s > 59) {
+  if (d < 1 || d > maxDay) {
     server.send(400, "text/plain", "Time values out of range"); return;
   }
   if (rtcAvailable) {
@@ -336,9 +373,12 @@ void handleExit() {
 // ─────────────────────────────────────────────────────────────────────────────
 // WiFi lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
-void startWifi() {
+bool startWifi() {
   WiFi.mode(WIFI_AP);
-  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  if (!WiFi.softAP(WIFI_SSID, WIFI_PASS)) {
+    Serial.println("WiFi AP failed to start");
+    return false;
+  }
 
   // Register routes once; server.stop() does not clear handlers
   static bool routesRegistered = false;
@@ -352,6 +392,7 @@ void startWifi() {
   server.begin();
   wifiExitReq = false;
   Serial.println("WiFi AP started — connect to \"" WIFI_SSID "\" then open http://192.168.4.1");
+  return true;
 }
 
 void stopWifi() {
@@ -452,9 +493,30 @@ void logToSD(const String &timestamp,
              float busV, float currMa, float powerMw,
              bool overflow) {
   if (!sdAvailable) return;
-  File f = SD.open("/data.csv", FILE_APPEND);
+
+  // Build daily filename: /data_YYYY-MM-DD.csv (fallback: /data_no-rtc.csv)
+  String dateStr = (timestamp.length() >= 10) ? timestamp.substring(0, 10) : "no-rtc";
+  String path = "/data_" + dateStr + ".csv";
+
+  // Write CSV header only when the file is first created (checked once per day)
+  static String lastPath = "";
+  if (path != lastPath) {
+    if (!SD.exists(path)) {
+      File fh = SD.open(path, FILE_WRITE);
+      if (fh) {
+        fh.println("datetime,bus_V,current_mA,power_mW,overflow");
+        fh.close();
+      } else {
+        sdWriteOk = false;
+        return;
+      }
+    }
+    lastPath = path;
+  }
+
+  File f = SD.open(path, FILE_APPEND);
   if (!f) {
-    Serial.println("SD write error");
+    Serial.println("SD write error: " + path);
     sdWriteOk = false;
     return;
   }
@@ -468,6 +530,7 @@ void logToSD(const String &timestamp,
 }
 
 void continuousSampling() {
+  if (!isWiFiMode) updateLED();
   if (!inaAvailable) return;
 
   ina226.readAndClearFlags();
@@ -505,5 +568,4 @@ void continuousSampling() {
     displayOLED(now, rtcAvailable, busV, currMa, powerMw, overflow);
   }
   logToSD(ts, busV, currMa, powerMw, overflow);
-  if (!isWiFiMode) updateLED();
 }
