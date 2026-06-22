@@ -1,6 +1,6 @@
 # SWD INA226 Power Monitor
 
-A portable power monitoring system based on the **ESP32-C3 Super Mini**, using an INA226 sensor to measure bus voltage, current, and power in real time. Readings are timestamped by a DS3231 RTC and logged to a MicroSD card. Supports OLED display with button wake and a WiFi hotspot for remote access.
+A portable power monitoring system based on the **ESP32-C3 Super Mini**, using an INA226 sensor to measure bus voltage, current, and power in real time. Readings are timestamped by a DS3231 RTC and logged to daily CSV files on a MicroSD card. Supports OLED display with button wake and a WiFi hotspot for remote access and file management.
 
 ---
 
@@ -8,11 +8,13 @@ A portable power monitoring system based on the **ESP32-C3 Super Mini**, using a
 
 - Real-time measurement of bus voltage, current, and power — sampled every 3 seconds
 - DS3231 RTC timestamps every reading; time is retained across power cycles
-- Readings appended to a CSV file on the SD card
+- Daily CSV files (`data_YYYY-MM-DD.csv`) — one file per day, created automatically
+- I2C bus scan on every boot: serial output lists all detected devices and addresses for easy diagnosis
 - Short-press BOOT button to wake the OLED; auto-off after 15 seconds of inactivity
 - **Long-press BOOT button (3 s)** to start a WiFi access point — connect your phone and open `192.168.4.1` to:
   - View live measurements
-  - Download `data.csv`
+  - Browse, download, or delete individual daily CSV files
+  - Delete all data files at once
   - Sync the RTC from your phone's clock
 - Onboard LED status indicator: blinks on SD or INA226 fault, off when all is well
 - Serial output of all values for debugging
@@ -43,7 +45,17 @@ A portable power monitoring system based on the **ESP32-C3 Super Mini**, using a
 | VCC | 3.3 V |
 | GND | GND |
 
-The three I2C devices are distinguished by address: OLED `0x3C`, INA226 `0x40`, DS3231 `0x68`.
+The three I2C devices are distinguished by address: OLED `0x3C`, DS3231 `0x68`.
+
+The INA226 address depends on its A0 and A1 pins:
+
+| A1 | A0 | Address |
+|----|----|---------|
+| GND | GND | `0x40` (most common) |
+| GND | VS  | `0x41` |
+| VS  | GND | `0x44` |
+
+Check the serial output at boot for the actual detected address, then update `#define INA226_ADDR` in the code accordingly.
 
 ### SPI bus — MicroSD
 
@@ -114,8 +126,28 @@ Search and install via Sketch → Include Library → Manage Libraries:
 
 1. Connect the ESP32-C3 Super Mini via USB-C
 2. Open `swd_ina226.ino` in Arduino IDE
-3. Select the correct board and port, then click Upload
-4. Open Serial Monitor at **115200 baud** to view the init log and live readings
+3. Verify that `#define INA226_ADDR` matches your module (flash once and check the serial I2C scan output if unsure)
+4. Select the correct board and port, then click Upload
+5. Open Serial Monitor at **115200 baud** to view the init log and live readings
+
+---
+
+## Boot Diagnostics (serial output example)
+
+```
+I2C scan:
+  0x3C (OLED)
+  0x44 (INA226)
+  0x68 (DS3231)
+
+OLED OK
+INA226 OK
+DS3231 OK
+SD card OK
+SWD_INA226 ready
+```
+
+If the INA226 address does not match `#define INA226_ADDR`, update the define and re-flash.
 
 ---
 
@@ -124,7 +156,7 @@ Search and install via Sketch → Include Library → Manage Libraries:
 The OLED shows a 2-second splash screen on boot, then turns off. **Short-press the BOOT button** to wake it; it turns off again after 15 seconds of inactivity.
 
 ```
-2026-06-21 12:30:45
+2026-06-22 12:30:45
 Bus:   5.091 V
 Curr: 391.42 mA
 Powr: 1990.3 mW
@@ -156,7 +188,8 @@ Status: OK
 The web page provides:
 
 - Live data (refreshed on each page load)
-- **Download CSV** — downloads `data.csv` directly to your device
+- **Data Files** list — all daily CSV files on the SD card, each with a Download and Delete button
+- **Delete All** — removes all data files at once (requires confirmation)
 - **Sync RTC with Phone** — sets the DS3231 to your phone's current time
 - **Exit WiFi** — shuts down the hotspot and returns to normal mode
 
@@ -166,11 +199,19 @@ Sampling continues every 3 seconds while the hotspot is active. The LED blinks c
 
 ## CSV Format
 
-`data.csv` is created automatically in the SD card root directory. Each sample appends one row; existing data is never overwritten on reboot.
+A new file is created automatically each day. When the RTC is unavailable, `data_no-rtc.csv` is used as a fallback:
+
+```
+data_2026-06-22.csv
+data_2026-06-23.csv
+data_no-rtc.csv      ← used when RTC is absent
+```
+
+Each file format:
 
 ```csv
 datetime,bus_V,current_mA,power_mW,overflow
-2026-06-21 12:30:45,5.091,391.42,1990.30,0
+2026-06-22 12:30:45,5.091,391.42,1990.30,0
 ```
 
 | Field | Description |
@@ -196,5 +237,5 @@ datetime,bus_V,current_mA,power_mW,overflow
 ## Sampling Cycle
 
 ```
-Read INA226 → Write SD → Wait 3 s → repeat
+Read INA226 → Write to daily CSV → Wait 3 s → repeat
 ```
